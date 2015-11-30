@@ -21,6 +21,7 @@
 
 try:
     import json
+    import ssl
 except ImportError:
     import simplejson as json
 
