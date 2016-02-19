@@ -101,6 +101,7 @@ EXAMPLES = '''
 '''
 
 import platform
+import plistlib
 import os
 import re
 import tempfile
@@ -925,6 +926,119 @@ class LinuxService(Service):
                 stderr = stderr1 + stderr2
 
         return(rc_state, stdout, stderr)
+        
+# ===========================================
+# Subclass: Darwin
+
+class DarwinService(Service):
+    """
+    This is the Darwin Service manipulation class - it uses launchctl(1)
+    for service control.
+    """
+
+    platform = 'Darwin'
+    distribution = None
+
+    def get_service_tools(self):
+        self.svc_cmd = self.module.get_bin_path('launchctl', True)
+
+        if not self.svc_cmd:
+            self.module.fail_json(msg='unable to find launchctl binary')
+        
+        self.enable_cmd = self.svc_cmd
+
+    def get_service_status(self):
+        rc, stdout, stderr = self.execute_command('%s %s' % (self.svc_cmd, 'list'))
+        if rc != 0:
+            self.module.fail_json(msg='running %s %s failed' % (self.svc_cmd, 'list'))
+
+        self.running = False
+        for line in stdout.splitlines():
+            pid, last_exit_code, label = line.split('\t')
+            if label == self.name and pid != '-':
+                self.running = True
+                break   
+                
+    def service_enable(self):
+        if not self.enable_cmd:
+            self.module.fail_json(msg='cannot detect command to enable service %s' % self.name)
+        
+        service_plist_path = self.discover_service_plist(self.name)
+        if service_plist_path is None:
+            self.module.fail_json(msg='unable to infer the path of %s service plist file' % self.name)
+        
+        # Launchctl does not expose functionalities to set the RunAtLoad
+        # attribute of a job definition. So we parse and modify the job definition
+        # plist file directly for this purpose.
+        service_plist = plistlib.readPlist(service_plist_path)
+        service_enabled = service_plist.get('RunAtLoad', False)
+        service_plist['RunAtLoad'] = self.enable
+        plistlib.writePlist(service_plist, service_plist_path)
+        
+        if self.enable != service_enabled:
+            self.changed = True
+                
+    def service_control(self):
+        if self.action == 'start':
+            rc_state, stdout, stderr = self.execute_command('%s %s %s %s' % (self.svc_cmd, 'start', self.name, self.arguments))
+        if self.action == 'stop':
+            rc_state, stdout, stderr = self.execute_command('%s %s %s %s' % (self.svc_cmd, 'stop', self.name, self.arguments))
+        if self.action == 'restart':
+            # launchctl does not expose any restart command. Thus, we stop and start the process.
+            # The service can then be considered properly restarted. 
+            rc1, stdout1, stderr1 = self.execute_command('%s %s %s %s' % (self.svc_cmd, 'stop', self.name, self.arguments), daemonize=True)
+                
+            if self.sleep:
+                time.sleep(self.sleep)
+                
+            rc2, stdout2, stderr2 = self.execute_command('%s %s %s %s' % (self.svc_cmd, 'start', self.name, self.arguments), daemonize=True)
+
+            # merge return information
+            if rc1 != 0 and rc2 == 0:
+                rc_state = rc2
+                stdout = stdout2
+                stderr = stderr2
+            else:
+                rc_state = rc1 + rc2
+                stdout = stdout1 + stdout2
+                stderr = stderr1 + stderr2
+        if self.action == 'reload':
+            # launchctl does not expose any reload command. Thus, we unload and load the service.
+            # The service can then be considered properly reloaed. 
+            service_plist_path = self.discover_service_plist(self.name)
+            rc1, stdout1, stderr1 = self.execute_command('%s %s %s %s' % (self.svc_cmd, 'unload', service_plist_path, self.arguments), daemonize=True)
+            rc2, stdout2, stderr2 = self.execute_command('%s %s %s %s' % (self.svc_cmd, 'load', service_plist_path, self.arguments), daemonize=True)
+            
+            # merge return information
+            if rc1 != 0 and rc2 == 0:
+                rc_state = rc2
+                stdout = stdout2
+                stderr = stderr2
+            else:
+                rc_state = rc1 + rc2
+                stdout = stdout1 + stdout2
+                stderr = stderr1 + stderr2
+
+        return (rc_state, stdout, stderr)
+        
+    def discover_service_plist(self, service_name):
+        launchd_paths = [
+            '~/Library/LaunchAgents',
+            '/Library/LaunchAgents',
+            '/Library/LaunchDaemons',
+            '/System/Library/LaunchAgents',
+            '/System/Library/LaunchDaemons'
+        ]
+            
+        for path in launchd_paths:
+            try:
+                files = os.listdir(os.path.expanduser(path))
+            except OSError:
+                continue
+                    
+            for filename in files:
+                if filename == '%s.plist' % service_name:
+                    return os.path.join(path, filename)
 
 # ===========================================
 # Subclass: FreeBSD
@@ -1172,7 +1286,7 @@ class NetBsdService(Service):
     distribution = None
 
     def get_service_tools(self):
-        initpaths = [ '/etc/rc.d' ]  # better: $rc_directories - how to get in here? Run: sh -c '. /etc/rc.conf ; echo $rc_directories'
+        initpaths = [ '/etc/rc.d' ]	 # better: $rc_directories - how to get in here? Run: sh -c '. /etc/rc.conf ; echo $rc_directories'
 
         for initdir in initpaths:
             initscript = "%s/%s" % (initdir,self.name)
